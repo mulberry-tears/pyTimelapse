@@ -1,0 +1,15 @@
+[project]
+name = "pytimelapse"
+version = "0.1.0"
+description = "Windows 11 timelapse screen recorder using dxcam, PySide6, OpenCV, and FFmpeg"
+requires-python = ">=3.12"
+readme = "README.md"
+dependencies = [
+    "pyside6>=6.9",
+    "dxcam>=0.0.5",
+    "opencv-python>=4.10",
+    "psutil>=5.9",
+]
+
+[project.scripts]
+pytimelapse = "main:main"
