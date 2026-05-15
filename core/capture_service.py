@@ -31,6 +31,8 @@ class RecorderWorker(QObject):
         self._settings = settings
         self._logger = logging.getLogger("timelapse.recorder")
         self._stop_event = Event()
+        self._resume_event = Event()
+        self._resume_event.set()
         self._camera = None
 
     @Slot()
@@ -50,8 +52,14 @@ class RecorderWorker(QObject):
             next_capture = time.monotonic()
 
             while not self._stop_event.is_set():
+                if not self._resume_event.is_set():
+                    if self._wait_until_resumed_or_stopped():
+                        break
+                    next_capture = time.monotonic()
+                    continue
+
                 delay = max(0.0, next_capture - time.monotonic())
-                if self._stop_event.wait(delay):
+                if self._wait_for_capture_window(delay):
                     break
 
                 captured_at = datetime.now()
@@ -99,6 +107,15 @@ class RecorderWorker(QObject):
     def stop(self) -> None:
         """Request the worker loop to stop."""
         self._stop_event.set()
+        self._resume_event.set()
+
+    def pause(self) -> None:
+        """Pause frame capture without ending the recording session."""
+        self._resume_event.clear()
+
+    def resume(self) -> None:
+        """Resume frame capture after a pause."""
+        self._resume_event.set()
 
     def _create_camera(self):
         self._logger.info("Initializing dxcam for output index %s", self._settings.monitor_index)
@@ -143,6 +160,25 @@ class RecorderWorker(QObject):
 
         self._camera = None
 
+    def _wait_until_resumed_or_stopped(self) -> bool:
+        self.status_changed.emit("Recording paused")
+        while not self._stop_event.is_set():
+            if self._resume_event.wait(0.1):
+                self.status_changed.emit("Recording resumed")
+                return False
+        return True
+
+    def _wait_for_capture_window(self, delay: float) -> bool:
+        remaining = delay
+        while remaining > 0:
+            slice_seconds = min(0.1, remaining)
+            if self._stop_event.wait(slice_seconds):
+                return True
+            if not self._resume_event.is_set():
+                return False
+            remaining -= slice_seconds
+        return self._stop_event.is_set()
+
 
 class RecorderController(QObject):
     """Manage the recorder worker and its QThread lifecycle."""
@@ -150,6 +186,7 @@ class RecorderController(QObject):
     status_changed = Signal(str)
     frame_count_changed = Signal(int)
     recording_state_changed = Signal(bool)
+    pause_state_changed = Signal(bool)
     session_directory_changed = Signal(str)
     output_ready = Signal(str)
     failure = Signal(str)
@@ -161,11 +198,17 @@ class RecorderController(QObject):
         self._thread: QThread | None = None
         self._worker: RecorderWorker | None = None
         self._is_recording = False
+        self._is_paused = False
 
     @property
     def is_recording(self) -> bool:
         """Return whether a recording session is active."""
         return self._is_recording
+
+    @property
+    def is_paused(self) -> bool:
+        """Return whether the active recording is paused."""
+        return self._is_paused
 
     def start_recording(self, settings: RecorderSettings) -> None:
         """Create the worker thread and start recording."""
@@ -193,7 +236,9 @@ class RecorderController(QObject):
         self._thread = thread
         self._worker = worker
         self._is_recording = True
+        self._is_paused = False
         self.recording_state_changed.emit(True)
+        self.pause_state_changed.emit(False)
         self.status_changed.emit("Starting recorder thread")
         thread.start()
 
@@ -204,6 +249,24 @@ class RecorderController(QObject):
 
         self.status_changed.emit("Stopping capture loop")
         self._worker.stop()
+
+    def pause_recording(self) -> None:
+        """Pause an active recording session."""
+        if not self._is_recording or self._is_paused or self._worker is None:
+            return
+
+        self._is_paused = True
+        self._worker.pause()
+        self.pause_state_changed.emit(True)
+
+    def resume_recording(self) -> None:
+        """Resume a paused recording session."""
+        if not self._is_recording or not self._is_paused or self._worker is None:
+            return
+
+        self._is_paused = False
+        self._worker.resume()
+        self.pause_state_changed.emit(False)
 
     def shutdown(self, timeout_ms: int = 15_000) -> bool:
         """Stop an active recording and wait for the worker thread to finish."""
@@ -224,7 +287,9 @@ class RecorderController(QObject):
     @Slot(bool, str, str)
     def _handle_worker_finished(self, success: bool, message: str, output_path: str) -> None:
         self._is_recording = False
+        self._is_paused = False
         self.recording_state_changed.emit(False)
+        self.pause_state_changed.emit(False)
         self.recording_finished.emit(success, message)
 
         if success:

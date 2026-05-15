@@ -49,6 +49,9 @@ class MainWindow(QMainWindow):
         self._cpu_monitor = CpuMonitor(interval_ms=1500, parent=self)
         self._monitors: list[ScreenInfo] = []
         self._recording_started_at: datetime | None = None
+        self._paused_started_at: datetime | None = None
+        self._total_paused_seconds = 0.0
+        self._is_paused = False
         self._latest_frame_count = 0
 
         self.setWindowTitle("Timelapse Screen Recorder")
@@ -147,9 +150,12 @@ class MainWindow(QMainWindow):
         buttons_layout.setContentsMargins(0, 0, 0, 0)
         buttons_layout.setSpacing(12)
         self.start_button = QPushButton("Start Recording")
+        self.pause_button = QPushButton("Pause Recording")
+        self.pause_button.setEnabled(False)
         self.stop_button = QPushButton("Stop Recording")
         self.stop_button.setEnabled(False)
         buttons_layout.addWidget(self.start_button)
+        buttons_layout.addWidget(self.pause_button)
         buttons_layout.addWidget(self.stop_button)
         buttons_layout.addStretch(1)
 
@@ -200,6 +206,7 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.start_button.clicked.connect(self._start_recording)
+        self.pause_button.clicked.connect(self._toggle_pause_recording)
         self.stop_button.clicked.connect(self._stop_recording)
         self.output_dir_button.clicked.connect(self._choose_output_dir)
         self.ffmpeg_path_button.clicked.connect(self._choose_ffmpeg_path)
@@ -210,6 +217,7 @@ class MainWindow(QMainWindow):
         self._controller.status_changed.connect(self._set_status)
         self._controller.frame_count_changed.connect(self._update_frame_count)
         self._controller.recording_state_changed.connect(self._update_recording_state)
+        self._controller.pause_state_changed.connect(self._update_pause_state)
         self._controller.session_directory_changed.connect(self._update_session_directory)
         self._controller.output_ready.connect(self._handle_output_ready)
         self._controller.failure.connect(self._handle_failure)
@@ -355,6 +363,9 @@ class MainWindow(QMainWindow):
             return
 
         self._latest_frame_count = 0
+        self._total_paused_seconds = 0.0
+        self._paused_started_at = None
+        self._is_paused = False
         self.frame_count_value.setText("0")
         self.output_path_value.setText(str(settings.output_dir))
         self._controller.start_recording(settings)
@@ -366,6 +377,18 @@ class MainWindow(QMainWindow):
         self._set_status("Stopping recording...")
         self._append_log("Stop requested by user")
         self._controller.stop_recording()
+
+    def _toggle_pause_recording(self) -> None:
+        if not self._controller.is_recording:
+            return
+
+        if self._controller.is_paused:
+            self._append_log("Resume requested by user")
+            self._controller.resume_recording()
+            return
+
+        self._append_log("Pause requested by user")
+        self._controller.pause_recording()
 
     def _build_settings(self) -> RecorderSettings:
         output_name = sanitize_file_name(self.output_name_edit.text().strip())
@@ -410,6 +433,7 @@ class MainWindow(QMainWindow):
 
     def _update_recording_state(self, is_recording: bool) -> None:
         self.start_button.setEnabled(not is_recording and bool(self._monitors))
+        self.pause_button.setEnabled(is_recording)
         self.stop_button.setEnabled(is_recording)
 
         for widget in (
@@ -430,11 +454,34 @@ class MainWindow(QMainWindow):
 
         if is_recording:
             self._recording_started_at = datetime.now()
+            self._paused_started_at = None
+            self._total_paused_seconds = 0.0
+            self._is_paused = False
+            self.pause_button.setText("Pause Recording")
             self._elapsed_timer.start()
         else:
             self._elapsed_timer.stop()
             self._recording_started_at = None
+            self._paused_started_at = None
+            self._total_paused_seconds = 0.0
+            self._is_paused = False
+            self.pause_button.setText("Pause Recording")
             self.elapsed_value.setText("00:00:00")
+
+    def _update_pause_state(self, is_paused: bool) -> None:
+        self._is_paused = is_paused
+        self.pause_button.setText("Resume Recording" if is_paused else "Pause Recording")
+
+        if is_paused:
+            self._paused_started_at = datetime.now()
+            return
+
+        if self._paused_started_at is not None:
+            paused_delta = datetime.now() - self._paused_started_at
+            self._total_paused_seconds += paused_delta.total_seconds()
+            self._paused_started_at = None
+
+        self._update_elapsed()
 
     def _update_session_directory(self, session_directory: str) -> None:
         self.frames_path_value.setText(session_directory)
@@ -460,9 +507,10 @@ class MainWindow(QMainWindow):
             self.elapsed_value.setText("00:00:00")
             return
 
-        elapsed = datetime.now() - self._recording_started_at
-        total_seconds = int(elapsed.total_seconds())
-        hours, remainder = divmod(total_seconds, 3600)
+        elapsed_reference = self._paused_started_at or datetime.now()
+        elapsed = elapsed_reference - self._recording_started_at
+        elapsed_seconds = max(0, int(elapsed.total_seconds() - self._total_paused_seconds))
+        hours, remainder = divmod(elapsed_seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
         self.elapsed_value.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
 
